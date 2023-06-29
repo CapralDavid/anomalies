@@ -1,0 +1,145 @@
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, UpSampling2D
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from sklearn.neighbors import KernelDensity
+import numpy as np
+import random
+import glob
+from PIL import Image
+import matplotlib.pyplot as plt
+
+# Set random seed for reproducibility
+random.seed(42)
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# Size of input images
+SIZE = 128
+
+# Define generators for training, validation, and anomaly data
+batch_size = 64
+datagen = ImageDataGenerator(rescale=1./255)
+
+train_generator = datagen.flow_from_directory(
+    'cell_images2/uninfected_train/',
+    target_size=(SIZE, SIZE),
+    batch_size=batch_size,
+    class_mode='input'
+)
+
+validation_generator = datagen.flow_from_directory(
+    'cell_images2/uninfected_test/',
+    target_size=(SIZE, SIZE),
+    batch_size=batch_size,
+    class_mode='input'
+)
+
+anomaly_generator = datagen.flow_from_directory(
+    'cell_images2/parasitized/',
+    target_size=(SIZE, SIZE),
+    batch_size=batch_size,
+    class_mode='input'
+)
+
+# Define the autoencoder architecture
+def build_autoencoder():
+    # Encoder
+    inputs = tf.keras.Input(shape=(SIZE, SIZE, 3))
+    x = Conv2D(64, (3, 3), activation='relu', padding='same')(inputs)
+    x = MaxPooling2D((2, 2), padding='same')(x)
+    x = Conv2D(32, (3, 3), activation='relu', padding='same')(x)
+    x = MaxPooling2D((2, 2), padding='same')(x)
+    x = Conv2D(16, (3, 3), activation='relu', padding='same')(x)
+    x = MaxPooling2D((2, 2), padding='same')(x)
+
+    # Decoder
+    x = Conv2D(16, (3, 3), activation='relu', padding='same')(x)
+    x = UpSampling2D((2, 2))(x)
+    x = Conv2D(32, (3, 3), activation='relu', padding='same')(x)
+    x = UpSampling2D((2, 2))(x)
+    x = Conv2D(64, (3, 3), activation='relu', padding='same')(x)
+    x = UpSampling2D((2, 2))(x)
+    outputs = Conv2D(3, (3, 3), activation='sigmoid', padding='same')(x)
+
+    autoencoder = Model(inputs, outputs)
+    return autoencoder
+
+# Build the autoencoder
+autoencoder = build_autoencoder()
+autoencoder.compile(optimizer='adam', loss='mean_squared_error', metrics=['mse'])
+autoencoder.summary()
+
+# Fit the autoencoder model
+history = autoencoder.fit(
+    train_generator,
+    steps_per_epoch=len(train_generator),
+    epochs=100,
+    validation_data=validation_generator,
+    validation_steps=len(validation_generator),
+    shuffle=True
+)
+
+# Plot the training and validation loss
+loss = history.history['loss']
+val_loss = history.history['val_loss']
+epochs = range(1, len(loss) + 1)
+plt.plot(epochs, loss, 'y', label='Training loss')
+plt.plot(epochs, val_loss, 'r', label='Validation loss')
+plt.title('Training and validation loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+plt.show()
+
+# Extract the encoder network with trained weights
+encoder = Model(inputs=autoencoder.input, outputs=autoencoder.layers[6].output)
+encoder.summary()
+
+# Calculate KDE using sklearn
+def calculate_density(images):
+    # Flatten the encoder output
+    encoded_images = encoder.predict(images)
+    encoded_images_flat = encoded_images.reshape((encoded_images.shape[0], -1))
+    
+    # Fit KDE to the encoded image data
+    kde = KernelDensity(kernel='gaussian', bandwidth=0.2).fit(encoded_images_flat)
+    return kde
+
+# Calculate density for normal (uninfected) images
+uninfected_kde = calculate_density(validation_generator)
+
+# Calculate density for anomaly (parasitized) images
+anomaly_kde = calculate_density(anomaly_generator)
+
+# Define density and reconstruction error thresholds based on analysis
+density_threshold = 2500
+reconstruction_error_threshold = 0.004
+
+# Function to check if an image is an anomaly
+def check_anomaly(image_path):
+    image = Image.open(image_path)
+    image = image.resize((SIZE, SIZE))
+    image = np.array(image) / 255.0
+    encoded_image = encoder.predict(np.expand_dims(image, axis=0))
+    encoded_image_flat = encoded_image.reshape((1, -1))
+    density = uninfected_kde.score_samples(encoded_image_flat)[0]
+    reconstruction = autoencoder.predict(np.expand_dims(image, axis=0))
+    reconstruction_error = np.mean(np.square(reconstruction - image))
+    
+    if density < density_threshold or reconstruction_error > reconstruction_error_threshold:
+        print("The image is an anomaly.")
+    else:
+        print("The image is NOT an anomaly.")
+
+# Load a couple of test images and verify if they are reported as anomalies
+para_file_paths = glob.glob('cell_images2/parasitized/images/*')
+uninfected_file_paths = glob.glob('cell_images2/uninfected_train/images/*')
+
+# Anomaly image verification
+num = random.randint(0, len(para_file_paths) - 1)
+check_anomaly(para_file_paths[num])
+
+# Good/normal image verification
+num = random.randint(0, len(uninfected_file_paths) - 1)
+check_anomaly(uninfected_file_paths[num])
